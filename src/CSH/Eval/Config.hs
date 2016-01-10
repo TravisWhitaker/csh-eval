@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+
 {-|
 Module      : CSH.Eval.Config
 Description : Configuration utilities
@@ -10,21 +11,26 @@ Portability : POSIX
 
 Provides functionality for reading config values.
 -}
+
 module CSH.Eval.Config (
-    evalConfig
+    Command (..)
+  , ServerCmd (..)
+  , DBInitCmd (..)
+  , PoolSettings (..)
+  , poolSettings
+  , evalConfig
   , cxCfgSettings
   , poolCfgSettings
   , module Data.Configurator
-  , Command (..)
-  , ServerCmd (..)
-  , DBInitCmd (..)
   ) where
 
+import Control.Monad (mfilter)
 import Data.Configurator
 import Data.Configurator.Types
 import Data.Word (Word16)
-import Hasql
-import Hasql.Postgres
+import Data.Time.Clock (NominalDiffTime)
+import Hasql.Settings
+import Hasql.Pool
 import System.Environment
 import qualified Data.ByteString.Char8 as C
 
@@ -46,6 +52,21 @@ data DBInitCmd = DBInitCmd
                 , dbName :: C.ByteString -- ^ Database name
                 }
 
+-- | Hasql pool settings.
+data PoolSettings = PoolSettings {
+    poolSize     :: Int             -- ^ Maximum number of connections.
+  , poolTimeout  :: NominalDiffTime -- ^ Individual connection timeout.
+  , poolSettings :: Settings        -- ^ Hasql connection settings.
+  }
+
+poolSettings :: Int             -- ^ Maxumum number of connections.
+             -> NominalDiffTime -- ^ Individual connection timeout.
+             -> Settings        -- ^ Hasql connection settings.
+             -> Maybe PoolSettings
+poolSettings c t s = PoolSettings <$> connOK c <*> timeOK t <*> pure s
+    where connOK = mfilter (>= 1)  . pure  -- Must have connections >= 1.
+          timeOK = mfilter (>= 60) . pure -- Must have connetion lifetime >= 1 minute.
+
 -- | Load a config from the path given by the 'CSH_EVAL_CONFIG' environment
 --   variable, or default to 'config/csh-eval.rc'
 evalConfig :: IO Config
@@ -55,7 +76,7 @@ evalConfig = lookupEnv "CSH_EVAL_CONFIG"
 
 -- | Derive hasql postgres connection settings from configuration.
 cxCfgSettings :: Config -> IO Settings
-cxCfgSettings cfg = ParamSettings
+cxCfgSettings cfg = settings
                 <$> (lookupDefault "localhost" cfg "db.host")
                 <*> (lookupDefault 5432 cfg "db.port")
                 <*> (lookupDefault "" cfg "db.user")
@@ -65,9 +86,10 @@ cxCfgSettings cfg = ParamSettings
 -- | Derive hasql pool settings from configuration.
 poolCfgSettings :: Config -> IO PoolSettings
 poolCfgSettings cfg = do
-    max_con <- (lookupDefault 1 cfg "db.pool.max_con")
-    idle_timeout <- (lookupDefault 10 cfg "db.pool.idle_timeout")
-    case poolSettings max_con idle_timeout of
+    max_con      <- lookupDefault 1 cfg "db.pool.max_con"
+    idle_timeout <- lookupDefault 60 cfg "db.pool.idle_timeout"
+    settings     <- cxCfgSettings Config
+    case poolSettings max_con idle_timeout settings of
         Just x -> pure x
         Nothing -> fail ("Bad pool settings config:\n  db.pool.max_con = "
                        ++ (show max_con)
