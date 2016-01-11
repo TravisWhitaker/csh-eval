@@ -55,17 +55,16 @@ module CSH.Eval.Model (
   -- * Cache
   , IDCache
   , Cache(..)
-  , defTxMode
-  , CacheM
+  , defTxRun
   , Cacheable
   , CacheError(..)
-  , runCacheable
   , execCacheable
   ) where
 
 import Control.Concurrent.MVar
 
-import Control.Monad.Trans.Either
+import Control.Monad.Reader
+import Control.Monad.Except
 import Control.Monad.IO.Class
 
 import Data.Maybe
@@ -85,8 +84,8 @@ import qualified Data.Text       as T
 
 import qualified Data.Map        as M
 
-import Hasql
-import Hasql.Postgres
+import Hasql.Connection
+import Hasql.Query
 
 import System.Log.Logger
 
@@ -777,7 +776,7 @@ type IDCache a = MVar (M.Map Word64 (MVar a))
 --   pool for fallbacks (this must be accessible within the 'Cacheable' monad).
 data Cache = Cache {
     -- | The PostgreSQL connection pool.
-    pool                                  :: Pool Postgres
+    pool                                  :: Pool
     -- | The Logger
   , logger                                :: Logger
     -- | Map from IDs to 'Member's.
@@ -862,35 +861,29 @@ data Cache = Cache {
   , duesTermIDCache                       :: IDCache [Dues]
   }
 
--- | Default Hasql transaction mode.
-defTxMode :: TxMode
-defTxMode = Just (Serializable, Just True)
-
--- | Interior transformer for operations directly on the cache state. Cache
---   users should never be able to bind out of this.
-type CacheM a = EitherT CacheError IO a
+-- | Default settings for Hasql 'Transaction' execution, including pool
+--   handling.
+defTxRun :: Transaction a -> Cacheable a
+defTxRun t = reader pool >>= ((mapError <$>) . flip use (run t Serializable Write))
+    where mapError (Left ce)         = throwError $ HasqlConnectionError ce
+          mapError (Right (Left re)) = throwError $ HasqlResultsError re
+          mapError (Right (Right x)) = return x
 
 -- | Exterior transformer for cache operations. Cache API caller-facing
 --   functions /must/ return into this exterior transformer.
-type Cacheable a = Cache -> CacheM a
+type Cacheabla a = ReaderT Cache (ExceptT CacheError IO a)
 
 -- | Cache error.
-data CacheError = HasqlError (SessionError Postgres)
+data CacheError = HasqlConnectionError ConnectionError
+                | HasqlResultsError ResultsError
                 | CacheError  String
                 | Nonexistent String
                 | Constraint  String
                 deriving (Show)
-
--- | Enables embedding the interior cache transformer within another
---   transformer. This is only OK to use if you're embedding something
---   'Cacheable' in a different exterior transformer. I'm not sure how to
---   enforce that at the type level. You probably shouldn't use this.
-runCacheable :: Cache -> Cacheable a -> CacheM a
-runCacheable c m = m c
 
 -- | Hoist 'Cacheable' into an IO capable monad.
 execCacheable :: MonadIO m
               => Cache                   -- ^ Cache instance to execute with
               -> Cacheable a             -- ^ Cache hitting function
               -> m (Either CacheError a) -- ^ Cache error or the function result
-execCacheable c m = liftIO $ runEitherT (m c)
+execCacheable c m = liftIO (runExceptT ((runReaderT m) c))
